@@ -27,7 +27,7 @@ DT_DEFAULT = 0.02                      # s – control‑loop period (50 Hz)
 
 # Torque thresholds (Nm)
 TORQUE_ENTER = 0.5                     # ≥ → driver clearly wants control
-TORQUE_EXIT  = 0.4                     # ≤ → driver has released wheel
+TORQUE_EXIT  = 1                     # ≤ → driver has released wheel
 
 # Debounce times (s)
 ENTER_TIME = 0.05                      # 50 ms continuous above TORQUE_ENTER
