@@ -26,8 +26,8 @@ from opendbc.car.interfaces import CarStateBase
 DT_DEFAULT = 0.02                      # s – control‑loop period (50 Hz)
 
 # Torque thresholds (Nm)
-TORQUE_ENTER = 1.0                     # ≥ → driver clearly wants control
-TORQUE_EXIT  = 0.6                     # ≤ → driver has released wheel
+TORQUE_ENTER = 0.5                     # ≥ → driver clearly wants control
+TORQUE_EXIT  = 0.4                     # ≤ → driver has released wheel
 
 # Debounce times (s)
 ENTER_TIME = 0.05                      # 50 ms continuous above TORQUE_ENTER
@@ -42,7 +42,7 @@ RAMP_T_5_10        = 0.75              # s – 5 … 10 km/h
 RAMP_T_ABOVE_10    = 0.5               # s – anything faster
 
 # HOLD‑nudge parameters
-HOLD_NUDGE_MAX_DEG = 1.5               # deg – maximum offset commanded in HOLD
+HOLD_NUDGE_MAX_DEG = 0.5               # deg – maximum offset commanded in HOLD
 
 # -----------------------------------------------------------------------------
 # Helper enum
