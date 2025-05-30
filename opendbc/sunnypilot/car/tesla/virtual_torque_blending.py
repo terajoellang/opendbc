@@ -1,12 +1,12 @@
 """
-Torque-blending / co-steering state-machine for Tesla (openpilot / opendbc).
+Torque‑blending / co‑steering state‑machine for Tesla (openpilot / opendbc).
 All comments in English.
 
 Behaviour summary
 -----------------
 AUTO       – normal openpilot control  
-HOLD       – driver holds wheel, we gently "nudge" ≤ ±1.5 ° toward planner
-RAMP_BACK  – interpolate wheel angle back to planner over a speed-based τ
+HOLD       – driver holds wheel, we gently "nudge" ≤ ±1.5 ° toward planner
+RAMP_BACK  – interpolate wheel angle back to planner over a speed‑based τ
 
 Copyright (c) 2025.
 Licensed under the MIT License.
@@ -23,25 +23,25 @@ from opendbc.car.interfaces import CarStateBase
 # Constants – tune to taste, keep semantic units.
 # -----------------------------------------------------------------------------
 
-DT_DEFAULT = 0.02                      # s – control-loop period (50 Hz)
+DT_DEFAULT = 0.02                      # s – control‑loop period (50 Hz)
 
 # Torque thresholds (Nm)
 TORQUE_ENTER = 1.0                     # ≥ → driver clearly wants control
 TORQUE_EXIT  = 0.6                     # ≤ → driver has released wheel
 
 # Debounce times (s)
-ENTER_TIME = 0.05                      # 50 ms continuous above TORQUE_ENTER
-EXIT_TIME  = 0.10                      # 100 ms continuous below TORQUE_EXIT
+ENTER_TIME = 0.05                      # 50 ms continuous above TORQUE_ENTER
+EXIT_TIME  = 0.10                      # 100 ms continuous below TORQUE_EXIT
 
-# Ramp-back durations as a function of speed – thresholds in m/s
-V_5_KMH      = 5.0 / 3.6               # 5 km/h ≈ 1.39 m/s
-V_10_KMH     = 10.0 / 3.6              # 10 km/h ≈ 2.78 m/s
+# Ramp‑back durations as a function of speed – thresholds in m/s
+V_5_KMH      = 5.0 / 3.6               # 5 km/h ≈ 1.39 m/s
+V_10_KMH     = 10.0 / 3.6              # 10 km/h ≈ 2.78 m/s
 
-RAMP_T_STANDSTILL = 1.0                # s – very gentle below 5 km/h
-RAMP_T_5_10        = 0.75              # s – 5 … 10 km/h
+RAMP_T_STANDSTILL = 1.0                # s – very gentle below 5 km/h
+RAMP_T_5_10        = 0.75              # s – 5 … 10 km/h
 RAMP_T_ABOVE_10    = 0.5               # s – anything faster
 
-# HOLD-nudge parameters
+# HOLD‑nudge parameters
 HOLD_NUDGE_MAX_DEG = 1.5               # deg – maximum offset commanded in HOLD
 
 # -----------------------------------------------------------------------------
@@ -49,7 +49,7 @@ HOLD_NUDGE_MAX_DEG = 1.5               # deg – maximum offset commanded in HOL
 # -----------------------------------------------------------------------------
 
 class TBState(enum.IntEnum):
-    """Three-state co-steering machine."""
+    """Three‑state co‑steering machine."""
     AUTO = 0       # openpilot has full control
     HOLD = 1       # driver holds wheel; we gently probe
     RAMP_BACK = 2  # wheel returns smoothly to planner
@@ -59,7 +59,7 @@ class TBState(enum.IntEnum):
 # -----------------------------------------------------------------------------
 
 class TorqueBlendingCarController:
-    """Driver-friendly torque-blending state machine with small HOLD nudge."""
+    """Driver‑friendly torque‑blending state machine with small HOLD nudge."""
 
     def __init__(self, dt: float = DT_DEFAULT):
         self.dt: float = dt
@@ -93,7 +93,7 @@ class TorqueBlendingCarController:
 
     @staticmethod
     def _ramp_duration_for_speed(v_ego: float) -> float:
-        """Piece-wise constant τ depending on speed (m/s)."""
+        """Piece‑wise constant τ depending on speed (m/s)."""
         if v_ego < V_5_KMH:
             return RAMP_T_STANDSTILL
         if v_ego < V_10_KMH:
@@ -113,7 +113,7 @@ class TorqueBlendingCarController:
     ) -> tuple[bool, float]:
         """Update function called by CarController each cycle."""
 
-        # Early-out if disabled
+        # Early‑out if disabled
         if not self.enabled:
             return lat_active, apply_angle
 
@@ -153,7 +153,7 @@ class TorqueBlendingCarController:
             delta = apply_angle - wheel_angle
             delta_clamped = np.clip(delta, -HOLD_NUDGE_MAX_DEG, HOLD_NUDGE_MAX_DEG)
             apply_out = wheel_angle + delta_clamped
-            lat_active_out = True  # keep lateral on for small nudge
+            lat_active_out = False
 
         else:  # RAMP_BACK
             alpha = np.clip(self.ramp_timer / self.ramp_duration, 0.0, 1.0)
@@ -164,7 +164,7 @@ class TorqueBlendingCarController:
 
 
 # -----------------------------------------------------------------------------
-# Optional helper – copy-unchanged from previous version
+# Optional helper – copy‑unchanged from previous version
 # -----------------------------------------------------------------------------
 
 class TorqueBlendingCarState:
