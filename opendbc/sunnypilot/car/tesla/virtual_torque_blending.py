@@ -1,190 +1,208 @@
 """
-Enhanced torque‑blending implementation for Tesla (openpilot / opendbc).
-All code comments are in English as requested.
+Torque‑blending / co‑steering state‑machine for Tesla (openpilot / opendbc).
+All comments in English.
 
 Copyright (c) 2025.
 Licensed under the MIT License.
 """
 
+from __future__ import annotations
+
+import enum
 import numpy as np
 from opendbc.car import structs
 from opendbc.car.interfaces import CarStateBase
 
 # -----------------------------------------------------------------------------
-# Constants
+# Constants – feel free to tune, but keep semantic units.
 # -----------------------------------------------------------------------------
 
-LOW_SPEED_ALLOWED = True
-LOW_SPEED_CUTOFF = 13.5  # m/s ≈ 30 mph – cut‑over speed for low‑speed handling
-LOW_SPEED_FADE_THRESHOLD = 5.0  # m/s – below this speed we use a slower fade‑out
+DT_DEFAULT = 0.02                      # s – control‑loop period (50 Hz)
 
-TORQUE_DEADZONE_BASE = 0.5        # Nm – always masked out
-TORQUE_DEADZONE_EXTRA = 0.15      # Nm – additional dead‑zone at very low speed
-TORQUE_TO_ANGLE_CLIP = 10.0       # Nm – absolute safety clamp in case of EPS glitches
-TORQUE_LINEAR_SCALE = 6.0         # Nm – tanh(x) reaches 76 % at ±6 Nm
-MAX_OFFSET_DEG = 12.0             # deg – maximum wheel offset produced by blending
+# Torque thresholds (Nm)
+TORQUE_ENTER = 2.0                     # ≥ → driver clearly wants control
+TORQUE_EXIT  = 0.3                     # ≤ → driver has released wheel
 
-OVERRIDE_CONTINUE_ANGLE = 10.0    # deg – hysteresis for staying in override
-OVERRIDE_TORQUE_THRESHOLD = 1.0   # Nm – cancels fade‑out instantly when driver re‑grabs
+# Debounce times (s)
+ENTER_TIME = 0.05                      # 50 ms continuous above TORQUE_ENTER
+EXIT_TIME  = 0.30                      # 300 ms continuous below TORQUE_EXIT
 
-# Controller loop period; change if your control cycle differs
-DEFAULT_DT = 0.02  # s (50 Hz)
+# Ramp‑back durations as a function of speed – thresholds in m/s
+V_STANDSTILL = 0.0                     # 0 km/h
+V_5_KMH      = 5.0 / 3.6               # 5 km/h ≈ 1.3889 m/s
+V_10_KMH     = 10.0 / 3.6              # 10 km/h ≈ 2.7778 m/s
+
+RAMP_T_STANDSTILL = 1.5                # s – very gentle below 5 km/h
+RAMP_T_5_10        = 1.0               # s – 5 … 10 km/h
+RAMP_T_ABOVE_10    = 0.5               # s – anything faster
+
+# Openpilot treats vEgo in m/s, so we keep all speed thresholds in m/s.
 
 # -----------------------------------------------------------------------------
-# Helper functions
+# Helper enum
 # -----------------------------------------------------------------------------
 
-def torque_blending_allowed(speed_mps: float) -> bool:
-    """True if torque‑blending should run at this vehicle speed."""
-    return (LOW_SPEED_ALLOWED and speed_mps < LOW_SPEED_CUTOFF) or speed_mps >= LOW_SPEED_CUTOFF
-
-
-def speed_factor(v_ego: float) -> float:
-    """Gain factor that scales linearly from 0.2 (standstill) to 1.0 (≥ LOW_SPEED_CUTOFF)."""
-    return np.clip(v_ego / LOW_SPEED_CUTOFF, 0.2, 1.0)
-
+class TBState(enum.IntEnum):
+    """Three‑state co‑steering machine."""
+    AUTO = 0       # openpilot has full control
+    HOLD = 1       # driver holds wheel, OP torque clamped
+    RAMP_BACK = 2  # wheel returns gently to planner angle
 
 # -----------------------------------------------------------------------------
 # Main controller
 # -----------------------------------------------------------------------------
 
 class TorqueBlendingCarController:
-    """Applies driver‑torque blending plus smooth fade‑out when the driver releases the wheel."""
+    """Implements a driver‑friendly torque‑blending state machine.
 
-    def __init__(self, dt: float = DEFAULT_DT):
+    Behaviour summary:
+      • AUTO      – normal openpilot control
+      • HOLD      – freeze wheel at current hardware angle, disable lateral
+      • RAMP_BACK – interpolate wheel angle back to planner over a speed‑based τ
+    """
+
+    # ---------------------------------------------------------------------
+    # Construction
+    # ---------------------------------------------------------------------
+
+    def __init__(self, dt: float = DT_DEFAULT):
+        self.dt: float = dt
         self.enabled: bool = True
-        self.steering_override: bool = False
-        self.fade_offset: float = 0.0  # current angle offset used for fade‑out (deg)
-        self.dt: float = dt            # control loop period (s)
+
+        # State machine variables
+        self.state: TBState = TBState.AUTO
+        self.ramp_timer: float = 0.0
+        self.ramp_duration: float = 0.0
+        self.ramp_start: float = 0.0
+
+        # Debounce timers
+        self._above_timer: float = 0.0
+        self._below_timer: float = 0.0
 
     # ---------------------------------------------------------------------
     # Internal helpers
     # ---------------------------------------------------------------------
 
-    def _torque_blended_angle(self, planner_angle: float, driver_torque: float, v_ego: float) -> float:
-        """Returns the blended steering angle while the driver is actively overriding."""
-        k_speed = speed_factor(v_ego)
+    def _update_debouncers(self, torque: float) -> None:
+        """Integrate timers for conditions ≥ TORQUE_ENTER and ≤ TORQUE_EXIT."""
+        if abs(torque) >= TORQUE_ENTER:
+            self._above_timer += self.dt
+        else:
+            self._above_timer = 0.0
 
-        # Dynamic dead‑zone increases slightly at very low speed so that simply resting
-        # a hand on the wheel does not trigger blending.
-        deadzone = TORQUE_DEADZONE_BASE + TORQUE_DEADZONE_EXTRA * (1.0 - k_speed)
-        if abs(driver_torque) < deadzone:
-            return planner_angle + self.fade_offset
+        if abs(torque) <= TORQUE_EXIT:
+            self._below_timer += self.dt
+        else:
+            self._below_timer = 0.0
 
-        # Remove the dead‑zone and compress torque via tanh() into ±1.
-        # Remove the dead‑zone and clamp to ±TORQUE_TO_ANGLE_CLIP in case the EPS
-        # sends out‑of‑range values. This retains the original "safety guard" behaviour.
-        torque_eff = driver_torque - np.sign(driver_torque) * deadzone
-        torque_eff = np.clip(torque_eff, -TORQUE_TO_ANGLE_CLIP, TORQUE_TO_ANGLE_CLIP)
-        torque_norm = np.tanh(torque_eff / TORQUE_LINEAR_SCALE)
-
-        # Convert normalised torque into a wheel offset (deg) proportional to speed.
-        offset_deg = torque_norm * MAX_OFFSET_DEG * k_speed
-
-        # Save for the upcoming fade‑out and return the blended angle.
-        self.fade_offset = offset_deg
-        return planner_angle + offset_deg
-
-    def _fade_time_constant(self, v_ego: float) -> float:
-        """Returns the fade‑out time constant τ (s) as a function of speed."""
-        # 1.5 s at standstill → 0.5 s at cutoff speed
-        return np.interp(v_ego,
-                         [0.0, LOW_SPEED_FADE_THRESHOLD, LOW_SPEED_CUTOFF],
-                         [1.5, 1.5, 0.5])
+    @staticmethod
+    def _ramp_duration_for_speed(v_ego: float) -> float:
+        """Piece‑wise constant τ depending on speed (m/s)."""
+        if v_ego < V_5_KMH:
+            return RAMP_T_STANDSTILL
+        if v_ego < V_10_KMH:
+            return RAMP_T_5_10
+        return RAMP_T_ABOVE_10
 
     # ---------------------------------------------------------------------
     # Public API – called once per control cycle
     # ---------------------------------------------------------------------
 
-    def update_torque_blending(self,
-                               CS: CarStateBase,
-                               CC: structs.CarControl,
-                               lat_active: bool,
-                               apply_angle: float) -> tuple[bool, float]:
-        """Main entry point.
+    def update_torque_blending(
+        self,
+        CS: CarStateBase,
+        CC: structs.CarControl,
+        lat_active: bool,
+        apply_angle: float,
+    ) -> tuple[bool, float]:
+        """Main entry point for the Sunnypilot CarController.
 
         Args:
-            CS:          Latest CarState instance.
-            CC:          Last CarControl sent (contains latActive).
-            lat_active:  Previous lateral‑active state – may be overridden here.
-            apply_angle: Planner steering angle before torque blending.
-
+            CS:          Current CarState (openpilot object).
+            CC:          Previous CarControl.
+            lat_active:  Lateral‑active flag before blending.
+            apply_angle: Planner steering angle before blending.
         Returns:
-            (lat_active, apply_angle) with updated values.
+            (lat_active, apply_angle) updated for torque‑blending state.
         """
 
-        # ------------------------------------------------------------------
-        # 1. Early exit when disabled or below speed threshold
-        # ------------------------------------------------------------------
-        if not self.enabled or not torque_blending_allowed(CS.out.vEgo):
-            self.fade_offset = 0.0
+        # Early exit if disabled – keep previous behaviour untouched
+        if not self.enabled:
             return lat_active, apply_angle
 
-        planner_angle = apply_angle
-        driver_torque = CS.out.steeringTorque
+        v_ego = CS.out.vEgo                      # m/s
+        wheel_angle_deg = CS.out.steeringAngleDeg
+        driver_torque = CS.out.steeringTorque    # Nm
 
         # ------------------------------------------------------------------
-        # 2. Detect driver override
+        # 1. Update debounce timers and decide state transitions
         # ------------------------------------------------------------------
-        hands_on = getattr(CS, "hands_on_level", 0) >= 3
-        angle_diff = abs(CS.out.steeringAngleDeg - planner_angle)
+        self._update_debouncers(driver_torque)
 
-        self.steering_override = hands_on or (
-            CS.out.steeringPressed and
-            angle_diff > OVERRIDE_CONTINUE_ANGLE and
-            not CS.out.standstill
-        )
+        if self.state == TBState.AUTO:
+            if self._above_timer >= ENTER_TIME:
+                # Driver clearly takes over → HOLD
+                self.state = TBState.HOLD
 
-        # Planner itself inactive → clear override
-        if not CC.latActive:
-            self.steering_override = False
+        elif self.state == TBState.HOLD:
+            # Stay frozen until driver lets go long enough
+            if self._below_timer >= EXIT_TIME:
+                self.state = TBState.RAMP_BACK
+                self.ramp_timer = 0.0
+                self.ramp_start = wheel_angle_deg
+                self.ramp_duration = self._ramp_duration_for_speed(v_ego)
+            # If driver torques again strongly we just stay in HOLD (above timer resets)
 
-        # ------------------------------------------------------------------
-        # 3. Apply either active blending or fade‑out
-        # ------------------------------------------------------------------
-        if self.steering_override:
-            # Active torque blending while the driver is exerting torque
-            apply_angle = self._torque_blended_angle(planner_angle, driver_torque, CS.out.vEgo)
-        else:
-            # Exponential fade‑out of any residual offset
-            if self.fade_offset != 0.0:
-                tau = self._fade_time_constant(CS.out.vEgo)
-                alpha = np.exp(-self.dt / tau)
-                self.fade_offset *= alpha
-                if abs(self.fade_offset) < 0.01:
-                    self.fade_offset = 0.0
-
-            apply_angle = planner_angle + self.fade_offset
-
-            # Cancel fade‑out immediately if the driver torques the wheel again
-            if abs(driver_torque) > OVERRIDE_TORQUE_THRESHOLD:
-                self.fade_offset = 0.0
+        elif self.state == TBState.RAMP_BACK:
+            # If driver grabs again → back to HOLD
+            if self._above_timer >= ENTER_TIME:
+                self.state = TBState.HOLD
+            else:
+                self.ramp_timer += self.dt
+                if self.ramp_timer >= self.ramp_duration:
+                    self.state = TBState.AUTO  # fade finished
 
         # ------------------------------------------------------------------
-        # 4. Final lateral‑active flag
+        # 2. Produce resulting apply_angle and lat_active according to state
         # ------------------------------------------------------------------
-        lat_active = CC.latActive and not self.steering_override
-        return lat_active, apply_angle
+        if self.state == TBState.AUTO:
+            # Full OP control
+            lat_active_out = CC.latActive  # keep original
+            apply_angle_out = apply_angle
+
+        elif self.state == TBState.HOLD:
+            # Freeze wheel; disable lateral so planner stops integrating error
+            lat_active_out = False
+            apply_angle_out = wheel_angle_deg
+
+        else:  # RAMP_BACK
+            alpha = np.clip(self.ramp_timer / self.ramp_duration, 0.0, 1.0)
+            apply_angle_out = self.ramp_start + alpha * (apply_angle - self.ramp_start)
+            lat_active_out = True  # lateral back on – we're guiding to planner
+
+        return lat_active_out, apply_angle_out
 
 
 # -----------------------------------------------------------------------------
-# Optional helper to map EAC errors to steeringDisengage flag
+# Optional helper that flags steeringDisengage from EAC errors.
 # -----------------------------------------------------------------------------
 
 class TorqueBlendingCarState:
-    """Augments the CarState with steering disengage information for sunny‑pilot."""
+    """Adds steeringDisengage flag for specific Tesla EAC errors."""
 
     def __init__(self):
-        self.enabled: bool = True
+        self.enabled = True
 
-    def update_torque_blending(self,
-                               ret: structs.CarState,
-                               eac_status: str,
-                               eac_error_code: str) -> None:
-        if not self.enabled or not torque_blending_allowed(ret.vEgo):
+    def update_torque_blending(
+        self,
+        ret: structs.CarState,
+        eac_status: str,
+        eac_error_code: str,
+    ) -> None:
+        if not self.enabled:
             return
 
         ret.steeringDisengage = (
-            eac_status == "EAC_INHIBITED" and
-            eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY"
+            eac_status == "EAC_INHIBITED"
+            and eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY"
         )
