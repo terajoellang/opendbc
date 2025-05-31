@@ -57,8 +57,13 @@ HOLD_NUDGE_RATE    = 5                 # issue every N frames (4 Hz)
 # Planner‑match threshold for early resume
 ANGLE_MATCH_THRESHOLD = 2.0            # deg
 
-# Grace period after AUTO engage (ignores driver torque)
-GRACE_AFTER_AUTO = 0.4                 # s
+# Grace period after AUTO engage – we ignore *small* driver torque but allow an
+# emergency breakout. If |torque| ≥ GRACE_TORQUE_BREAK the driver can still
+# override instantly during the grace window.
+# Grace period after AUTO engage – ignore *small* driver torque but allow an
+# emergency breakout if |torque| exceeds this value.
+GRACE_AFTER_AUTO   = 0.4  # s
+GRACE_TORQUE_BREAK = 5.0  # Nm – override threshold during grace                 # s
 
 # -----------------------------------------------------------------------------
 # Helper enum
