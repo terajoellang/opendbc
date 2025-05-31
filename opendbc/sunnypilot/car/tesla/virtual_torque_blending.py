@@ -1,21 +1,21 @@
 """
-Torque-blending / co-steering state-machine for Tesla (openpilot / opendbc).
+Torque‑blending / co‑steering state‑machine for Tesla (openpilot / opendbc).
 All comments in English.
 
 AUTO       – normal openpilot control  
-HOLD       – driver holds wheel, we gently nudge ≤±1 ° toward the planner  
-RAMP_BACK  – wheel eases back to planner with an S-curve (slow–fast–slow)  
+HOLD       – driver holds wheel, we gently nudge ≤±1 ° toward the planner  
+RAMP_BACK  – wheel eases back to planner with an S‑curve (slow–fast–slow)  
 
-Revisions (May 2025)
+Revisions (May 2025)
 --------------------
 * Keep variable names (`apply_angle_out`, `lat_active_out`) to minimise git diff.
-* Increase torque dead-band (TORQUE_EXIT) to 1.0 Nm – matches Tesla assist law.
-* HOLD nudges reduced to ±1 ° and issued only every 5th frame (rate-limit) to
+* Increase torque dead‑band (TORQUE_EXIT) to 1.0 Nm – matches Tesla assist law.
+* HOLD nudges reduced to ±1 ° and issued only every 5th frame (rate‑limit) to
   avoid continuous wheel creep.
-* S-curve (smooth-step) replaces linear interpolation for ramp-back.
-* 0.4 s "grace" after entering AUTO ignores residual driver torque – lets the
+* S‑curve (smooth‑step) replaces linear interpolation for ramp‑back.
+* 0.4 s "grace" after entering AUTO ignores residual driver torque – lets the
   system grab the wheel even if the driver is still resting a hand.
-* Additional exit condition: if wheel ≈ planner (|∆|<2 °) we auto-resume even
+* Additional exit condition: if wheel ≈ planner (|∆|<2 °) we auto‑resume even
   while the driver is lightly torquing.
 
 Copyright (c) 2025.
@@ -33,28 +33,28 @@ from opendbc.car.interfaces import CarStateBase
 # Constants
 # -----------------------------------------------------------------------------
 
-DT_DEFAULT = 0.02                      # s – control-loop period (50 Hz)
+DT_DEFAULT = 0.02                      # s – control‑loop period (50 Hz)
 
 # Torque thresholds (Nm)
 TORQUE_ENTER = 1.0                     # ≥ → driver clearly wants control
-TORQUE_EXIT  = 1.0                     # ≤ → driver has released wheel (dead-band)
+TORQUE_EXIT  = 1.0                     # ≤ → driver has released wheel (dead‑band)
 
 # Debounce times (s)
-ENTER_TIME = 0.05                      # 50 ms continuous above TORQUE_ENTER
-EXIT_TIME  = 0.10                      # 100 ms continuous below TORQUE_EXIT
+ENTER_TIME = 0.05                      # 50 ms continuous above TORQUE_ENTER
+EXIT_TIME  = 0.10                      # 100 ms continuous below TORQUE_EXIT
 
-# Ramp-back durations vs speed (m/s)
-V_5_KMH      = 5.0 / 3.6               # 1.39 m/s
-V_10_KMH     = 10.0 / 3.6              # 2.78 m/s
-RAMP_T_STANDSTILL = 1.0                # <5 km/h
-RAMP_T_5_10        = 0.75              # 5…10 km/h
-RAMP_T_ABOVE_10    = 0.5               # >10 km/h
+# Ramp‑back durations vs speed (m/s)
+V_5_KMH      = 5.0 / 3.6               # 1.39 m/s
+V_10_KMH     = 10.0 / 3.6              # 2.78 m/s
+RAMP_T_STANDSTILL = 1.0                # <5 km/h
+RAMP_T_5_10        = 0.75              # 5…10 km/h
+RAMP_T_ABOVE_10    = 0.5               # >10 km/h
 
-# HOLD-nudge parameters
-HOLD_NUDGE_MAX_DEG = 2.0               # deg – absolute cap per nudge
-HOLD_NUDGE_RATE    = 1                 # issue every N frames (4 Hz)
+# HOLD‑nudge parameters
+HOLD_NUDGE_MAX_DEG = 1.0               # deg – absolute cap per nudge
+HOLD_NUDGE_RATE    = 5                 # issue every N frames (4 Hz)
 
-# Planner-match threshold for early resume
+# Planner‑match threshold for early resume
 ANGLE_MATCH_THRESHOLD = 2.0            # deg
 
 # Grace period after AUTO engage (ignores driver torque)
@@ -74,7 +74,7 @@ class TBState(enum.IntEnum):
 # -----------------------------------------------------------------------------
 
 class TorqueBlendingCarController:
-    """Driver-friendly torque-blending state machine with gentle probing."""
+    """Driver‑friendly torque‑blending state machine with gentle probing."""
 
     def __init__(self, dt: float = DT_DEFAULT):
         self.dt = dt
@@ -90,7 +90,7 @@ class TorqueBlendingCarController:
         self._above_timer = 0.0
         self._below_timer = 0.0
 
-        # Frame counter for nudge rate-limit
+        # Frame counter for nudge rate‑limit
         self._frame = 0
 
         # Grace timer after (re)entering AUTO
@@ -127,7 +127,7 @@ class TorqueBlendingCarController:
 
     @staticmethod
     def _smooth_step(t: float) -> float:
-        """3t²-2t³ – slow-fast-slow S-curve."""
+        """3t²‑2t³ – slow‑fast‑slow S‑curve."""
         return t * t * (3.0 - 2.0 * t)
 
     # ------------------------------------------------------------------
@@ -152,7 +152,7 @@ class TorqueBlendingCarController:
         driver_torque = CS.out.steeringTorque   # Nm
 
         # Grace period after AUTO engage
-        ignore_torque = self.grace_timer > 0.0
+        ignore_torque = (self.grace_timer > 0.0) and (abs(driver_torque) < GRACE_TORQUE_BREAK)
         if self.grace_timer > 0.0:
             self.grace_timer = max(0.0, self.grace_timer - self.dt)
 
@@ -188,7 +188,7 @@ class TorqueBlendingCarController:
         lat_active_out = CC.latActive
 
         if self.state == TBState.HOLD:
-            # Rate-limited gentle nudge
+            # Rate‑limited gentle nudge
             if self._frame % HOLD_NUDGE_RATE == 0:
                 delta = np.clip(apply_angle - wheel_angle, -HOLD_NUDGE_MAX_DEG, HOLD_NUDGE_MAX_DEG)
                 apply_angle_out = wheel_angle + delta
