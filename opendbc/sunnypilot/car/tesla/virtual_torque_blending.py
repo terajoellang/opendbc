@@ -51,8 +51,8 @@ RAMP_T_5_10        = 0.75              # 5…10 km/h
 RAMP_T_ABOVE_10    = 0.5               # >10 km/h
 
 # HOLD-nudge parameters
-HOLD_NUDGE_MAX_DEG = 1.0               # deg – absolute cap per nudge
-HOLD_NUDGE_RATE    = 5                 # issue every N frames (4 Hz)
+HOLD_NUDGE_MAX_DEG = 2.0               # deg – absolute cap per nudge
+HOLD_NUDGE_RATE    = 1                 # issue every N frames (4 Hz)
 
 # Planner-match threshold for early resume
 ANGLE_MATCH_THRESHOLD = 2.0            # deg
