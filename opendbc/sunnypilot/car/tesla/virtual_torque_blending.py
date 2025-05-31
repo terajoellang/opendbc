@@ -44,7 +44,7 @@ RAMP_T_5_10        = 1.0               # 5…10 km/h  ← updated
 RAMP_T_ABOVE_10    = 1.0               # >10 km/h   ← updated
 
 # HOLD-nudge parameters
-HOLD_NUDGE_MAX_DEG = 2.0               # deg – absolute cap per nudge  ← updated
+HOLD_NUDGE_MAX_DEG = 4.0               # deg – absolute cap per nudge  ← updated
 HOLD_NUDGE_RATE    = 1                 # issue every frame  ← updated
 
 # Planner-match threshold for early resume
