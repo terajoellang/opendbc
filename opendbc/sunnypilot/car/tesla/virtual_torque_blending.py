@@ -2,17 +2,21 @@
 Torque-blending / co-steering state-machine for Tesla (openpilot / opendbc).
 All comments in English.
 
-Revision – May 2025
--------------------
-* HOLD_NUDGE_MAX_DEG → **2.0°** (stronger feel)
-* HOLD_NUDGE_RATE    → every frame (1) for more immediate feedback
-* RAMP_T_5_10 & RAMP_T_ABOVE_10 → **1 s** (slower ramp at >5 km/h)
-* Grace window (0.4 s) now fires **only when the user manually enables AP**
-  (transition lat_active False → True). It is **not** applied on automatic
-  re-entry from HOLD/RAMP_BACK.
+Key behaviour (May 2025)
+------------------------
+AUTO       – normal openpilot control  
+HOLD       – driver holds wheel, gentle nudge ≤ 2 °/frame  
+RAMP_BACK  – wheel eases back to planner with S-curve (slow-fast-slow)  
 
-Copyright (c) 2025.
-Licensed under the MIT License.
+Latest tweaks
+-------------
+* **Dynamic breakout thresholds** – easier to override when wheel ≠ planner.
+* **Grace window (0.4 s)** fires only on *manual* AP enable (latActive ↑).
+* **Emergency breakout** ≥ 5 Nm still works during grace.
+* **Ramp durations** ≥ 5 km/h = 1 s.  
+  Stand-still remains 1 s (parking manoeuvres feel natural).
+
+Copyright (c) 2025. MIT-licensed.
 """
 
 from __future__ import annotations
@@ -26,100 +30,84 @@ from opendbc.car.interfaces import CarStateBase
 # Constants
 # -----------------------------------------------------------------------------
 
-DT_DEFAULT = 0.02                      # s – control-loop period (50 Hz)
+DT = 0.02                               # s – control-loop period (50 Hz)
 
-# Torque thresholds (Nm)
-TORQUE_ENTER = 1.0                     # ≥ → driver clearly wants control
-TORQUE_EXIT  = 1.0                     # ≤ → driver has released wheel
+# Base torque thresholds (Nm)
+TORQUE_ENTER_BASE = 1.0                 # driver takes control ≥
+TORQUE_ENTER_MIN  = 0.6                 # lower bound after scaling
+TORQUE_EXIT       = 1.0                 # driver released ≤
+TORQUE_ANGLE_SCALE = 0.05               # Nm per deg of |planner-wheel|
 
-# Debounce times (s)
-ENTER_TIME = 0.05                      # 50 ms continuous above TORQUE_ENTER
-EXIT_TIME  = 0.10                      # 100 ms continuous below TORQUE_EXIT
+# Debounce (s)
+ENTER_TIME = 0.05                       # 50 ms
+EXIT_TIME  = 0.10                       # 100 ms
 
-# Ramp-back durations vs speed (m/s)
-V_5_KMH      = 5.0 / 3.6               # 1.39 m/s
-V_10_KMH     = 10.0 / 3.6              # 2.78 m/s
-RAMP_T_STANDSTILL = 1.0                # <5 km/h
-RAMP_T_5_10        = 1.0               # 5…10 km/h  ← updated
-RAMP_T_ABOVE_10    = 1.0               # >10 km/h   ← updated
+# Ramp-back τ vs speed (m/s)
+V_5  = 5.0 / 3.6                        # 1.39
+V_10 = 10.0 / 3.6                       # 2.78
+TAU_STAND    = 1.0                      # <5 km/h
+TAU_5_10     = 1.0                      # 5…10 km/h
+TAU_ABOVE_10 = 1.0                      # >10 km/h
 
-# HOLD-nudge parameters
-HOLD_NUDGE_MAX_DEG = 4.0               # deg – absolute cap per nudge  ← updated
-HOLD_NUDGE_RATE    = 1                 # issue every frame  ← updated
+# HOLD nudge
+HOLD_NUDGE_MAX = 2.0                   # deg/frame (absolute cap)
 
-# Planner-match threshold for early resume
-ANGLE_MATCH_THRESHOLD = 1.5            # deg
+# Early resume if angle & torque small
+ANGLE_MATCH = 1.5                       # deg
 
 # Grace window after manual enable
-GRACE_AFTER_ENABLE   = 0.4  # s
-GRACE_TORQUE_BREAK   = 5.0  # Nm – override threshold during grace
+GRACE_TIME  = 0.4                       # s
+GRACE_BREAK = 5.0                       # Nm – break grace
 
 # -----------------------------------------------------------------------------
-# Helper enum
+# FSM
 # -----------------------------------------------------------------------------
 
 class TBState(enum.IntEnum):
-    AUTO = 0       # openpilot has full control
-    HOLD = 1       # driver holds wheel, small nudges
-    RAMP_BACK = 2  # wheel returns to planner
+    AUTO = 0
+    HOLD = 1
+    RAMP_BACK = 2
 
 # -----------------------------------------------------------------------------
-# Main controller
+# Controller
 # -----------------------------------------------------------------------------
 
 class TorqueBlendingCarController:
-    """Driver-friendly torque-blending state machine."""
+    """Three-state driver-override controller with dynamic thresholds."""
 
-    def __init__(self, dt: float = DT_DEFAULT):
+    def __init__(self, dt: float = DT):
         self.dt = dt
         self.enabled = True
 
-        # FSM
-        self.state: TBState = TBState.AUTO
+        # FSM vars
+        self.state = TBState.AUTO
         self.ramp_timer = 0.0
-        self.ramp_duration = 0.0
+        self.ramp_dur = 0.0
         self.ramp_start = 0.0
 
         # Debouncers
-        self._above_timer = 0.0
-        self._below_timer = 0.0
+        self._above_t = 0.0
+        self._below_t = 0.0
 
-        # Frame counter for nudge rate-limit
+        # Misc
         self._frame = 0
-
-        # Grace timer only after manual enable
-        self.grace_timer = 0.0
-        self._prev_lat_active = False  # track transition for grace
+        self._prev_lat_active = False  # for grace detection
+        self.grace = 0.0
 
     # ------------------------------------------------------------------
-    # Helper functions
+    # Helpers
     # ------------------------------------------------------------------
 
-    def _update_debouncers(self, torque: float, ignore: bool) -> None:
-        if ignore:
-            self._above_timer = 0.0
-            self._below_timer = 0.0
-            return
-        if abs(torque) >= TORQUE_ENTER:
-            self._above_timer += self.dt
-        else:
-            self._above_timer = 0.0
-        if abs(torque) <= TORQUE_EXIT:
-            self._below_timer += self.dt
-        else:
-            self._below_timer = 0.0
+    def _smooth_step(self, x: float) -> float:
+        """3x²-2x³ S-curve."""
+        return x * x * (3.0 - 2.0 * x)
 
-    @staticmethod
-    def _ramp_tau(v_ego: float) -> float:
-        if v_ego < V_5_KMH:
-            return RAMP_T_STANDSTILL
-        if v_ego < V_10_KMH:
-            return RAMP_T_5_10
-        return RAMP_T_ABOVE_10
-
-    @staticmethod
-    def _smooth_step(t: float) -> float:
-        return t * t * (3.0 - 2.0 * t)  # 3t²-2t³
+    def _tau_for_speed(self, v: float) -> float:
+        if v < V_5:
+            return TAU_STAND
+        if v < V_10:
+            return TAU_5_10
+        return TAU_ABOVE_10
 
     # ------------------------------------------------------------------
     # Public API
@@ -132,87 +120,89 @@ class TorqueBlendingCarController:
         lat_active: bool,
         apply_angle: float,
     ) -> tuple[bool, float]:
-        """Returns (lat_active, apply_angle) after torque blending."""
-
-        # Detect manual enable transition for grace
-        if CC.latActive and not self._prev_lat_active:
-            self.grace_timer = GRACE_AFTER_ENABLE
-        self._prev_lat_active = CC.latActive
-
+        """Returns updated (lat_active, apply_angle)."""
         if not self.enabled:
             return lat_active, apply_angle
 
         v_ego = CS.out.vEgo
-        wheel_angle = CS.out.steeringAngleDeg
-        driver_torque = CS.out.steeringTorque
+        wheel = CS.out.steeringAngleDeg
+        torque = CS.out.steeringTorque
+        angle_err = abs(apply_angle - wheel)
 
-        # Grace handling
-        ignore_torque = (self.grace_timer > 0.0) and (abs(driver_torque) < GRACE_TORQUE_BREAK)
-        if self.grace_timer > 0.0:
-            self.grace_timer = max(0.0, self.grace_timer - self.dt)
+        # Detect manual enable rising edge for grace window
+        if lat_active and not self._prev_lat_active:
+            self.grace = GRACE_TIME
+        self._prev_lat_active = lat_active
 
-        # FSM transitions
-        self._update_debouncers(driver_torque, ignore_torque)
-        angle_diff = abs(apply_angle - wheel_angle)
+        # Grace countdown
+        in_grace = self.grace > 0.0
+        if in_grace:
+            self.grace = max(0.0, self.grace - self.dt)
+        ignore_small_torque = in_grace and abs(torque) < GRACE_BREAK
 
+        # Dynamic enter threshold (easier in curves)
+        dyn_enter = max(TORQUE_ENTER_BASE - TORQUE_ANGLE_SCALE * angle_err, TORQUE_ENTER_MIN)
+
+        # ----------------- Debouncers -----------------
+        if ignore_small_torque:
+            self._above_t = 0.0
+            self._below_t = 0.0
+        else:
+            self._above_t = self._above_t + self.dt if abs(torque) >= dyn_enter else 0.0
+            self._below_t = self._below_t + self.dt if abs(torque) <= TORQUE_EXIT else 0.0
+
+        # ----------------- FSM transitions -----------
         if self.state == TBState.AUTO:
-            if self._above_timer >= ENTER_TIME:
+            if self._above_t >= ENTER_TIME:
                 self.state = TBState.HOLD
 
         elif self.state == TBState.HOLD:
-            if (angle_diff < ANGLE_MATCH_THRESHOLD and self._below_timer >= EXIT_TIME) or \
-               (self._below_timer >= 2 * EXIT_TIME):
+            if (angle_err < ANGLE_MATCH and self._below_t >= EXIT_TIME) or self._below_t >= 2 * EXIT_TIME:
                 self.state = TBState.RAMP_BACK
                 self.ramp_timer = 0.0
-                self.ramp_start = wheel_angle
-                self.ramp_duration = self._ramp_tau(v_ego)
+                self.ramp_start = wheel
+                self.ramp_dur = self._tau_for_speed(v_ego)
 
         elif self.state == TBState.RAMP_BACK:
-            if self._above_timer >= ENTER_TIME:
+            if self._above_t >= ENTER_TIME:  # driver re-grabs
                 self.state = TBState.HOLD
             else:
                 self.ramp_timer += self.dt
-                if self.ramp_timer >= self.ramp_duration:
+                if self.ramp_timer >= self.ramp_dur:
                     self.state = TBState.AUTO
 
-        # Outputs
+        # ----------------- Outputs -------------------
         self._frame += 1
-        apply_angle_out = apply_angle
-        lat_active_out = CC.latActive
+        out_lat = CC.latActive
+        out_angle = apply_angle
 
         if self.state == TBState.HOLD:
-            if self._frame % HOLD_NUDGE_RATE == 0:
-                delta = np.clip(apply_angle - wheel_angle, -HOLD_NUDGE_MAX_DEG, HOLD_NUDGE_MAX_DEG)
-                apply_angle_out = wheel_angle + delta
+            if self._frame % 1 == 0:  # every frame now
+                delta = np.clip(apply_angle - wheel, -HOLD_NUDGE_MAX, HOLD_NUDGE_MAX)
+                out_angle = wheel + delta
             else:
-                apply_angle_out = wheel_angle
-            lat_active_out = False  # cut OP torque
+                out_angle = wheel
+            out_lat = False  # disable torque
 
         elif self.state == TBState.RAMP_BACK:
-            t_norm = np.clip(self.ramp_timer / self.ramp_duration, 0.0, 1.0)
-            alpha = self._smooth_step(t_norm)
-            apply_angle_out = self.ramp_start + alpha * (apply_angle - self.ramp_start)
-            lat_active_out = True
+            alpha = self._smooth_step(np.clip(self.ramp_timer / self.ramp_dur, 0.0, 1.0))
+            out_angle = self.ramp_start + alpha * (apply_angle - self.ramp_start)
+            out_lat = True
 
-        return lat_active_out, apply_angle_out
+        return out_lat, out_angle
 
 
 # -----------------------------------------------------------------------------
-# Helper class (unchanged)
+# CarState helper (unchanged semantic)
 # -----------------------------------------------------------------------------
 
 class TorqueBlendingCarState:
-    """Adds steeringDisengage flag for specific Tesla EAC errors."""
+    """Maps Tesla EAC errors to steeringDisengage."""
 
     def __init__(self):
         self.enabled = True
 
-    def update_torque_blending(
-        self,
-        ret: structs.CarState,
-        eac_status: str,
-        eac_error_code: str,
-    ) -> None:
+    def update_torque_blending(self, ret: structs.CarState, eac_status: str, eac_error_code: str) -> None:
         if not self.enabled:
             return
         ret.steeringDisengage = (
