@@ -1,6 +1,5 @@
 """
 Torque‑blending / co‑steering state‑machine for Tesla (openpilot / opendbc).
-All comments in English.
 
 Key behaviour (May 2025)
 ------------------------
