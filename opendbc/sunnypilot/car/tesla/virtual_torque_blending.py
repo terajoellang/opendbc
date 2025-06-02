@@ -1,214 +1,144 @@
 """
-Torque‑blending / co‑steering state‑machine for Tesla (openpilot / opendbc).
-
-Key behaviour (May 2025)
-------------------------
-AUTO       – normal openpilot control  
-HOLD       – driver holds wheel, gentle nudge ≤ 2 °/frame  
-RAMP_BACK  – wheel eases back to planner with S‑curve (slow‑fast‑slow)  
-
-Latest tweaks
--------------
-* **Dynamic breakout thresholds** – easier to override when wheel ≠ planner.
-* **Grace window (0.4 s)** fires only on *manual* AP enable (latActive ↑).
-* **Emergency breakout** ≥ 5 Nm still works during grace.
-* **Ramp durations** ≥ 5 km/h = 1 s.  
-  Stand‑still remains 1 s (parking manoeuvres feel natural).
-
-Copyright (c) 2025. MIT‑licensed.
+Copyright (c) 2021-, Haibin Wen, sunnypilot, and other contributors.
+This file is part of sunnypilot and is licensed under the MIT License.
+See the LICENSE.md file in the root directory for further details.
 """
 
-from __future__ import annotations
-
-import enum
+import time
 import numpy as np
 from opendbc.car import structs
 from opendbc.car.interfaces import CarStateBase
 
-# -----------------------------------------------------------------------------
-# Constants
-# -----------------------------------------------------------------------------
+# ---------------- Constants ----------------
+TORQUE_TO_ANGLE_DEADZONE = 0.5      # Nm. Ignore torque below this.
+TORQUE_TO_ANGLE_CLIP = 10.0         # Nm. Maximum effective torque.
+BLENDING_RAMP_DURATION = 0.5        # seconds over which the blend is ramped.
+# (Turn signal logic has been removed.)
 
-DT = 0.02                               # s – control‑loop period (50 Hz)
+# ---------------- Nonlinear Blending Multiplier ----------------
+def nonlinear_blending_multiplier(vehicle_speed: float) -> float:
+    """
+    Returns the base multiplier (in deg/Nm) that converts effective driver torque to a steering angle offset.
+    Speed-dependent (vehicle_speed in km/h):
+      0–15 km/h:   12.0   (highest sensitivity)
+      15–30 km/h:  9.0
+      30–50 km/h:  6.5
+      50–70 km/h:  5.0
+      70–140 km/h: 3.0   (lowest sensitivity)
+    """
+    if vehicle_speed < 15:
+        return 12.0
+    elif vehicle_speed < 30:
+        return 9.0
+    elif vehicle_speed < 50:
+        return 6.5
+    elif vehicle_speed < 70:
+        return 5.0
+    else:
+        return 3.0
 
-# Base torque thresholds (Nm)
-TORQUE_ENTER_BASE = 1.0                 # driver takes control ≥
-TORQUE_ENTER_MIN  = 0.4                 # lower bound after scaling
-TORQUE_EXIT       = 1.0                 # driver released ≤
-TORQUE_ANGLE_SCALE = 0.05               # Nm per deg of |planner‑wheel|
+# ---------------- Natural Torque Adjustment with Logistic Scaling ----------------
+def natural_torque_adjustment(apply_angle: float, torsion_bar_torque: float, vehicle_speed: float) -> float:
+    """
+    Computes the target steering angle command (in degrees) by blending the openpilot (SP) command with the driver’s torque.
+    Steps:
+      1. If driver's torque is below the deadzone, return the SP command.
+      2. Otherwise, subtract the deadzone (preserving sign) and clip the torque.
+      3. Choose a base multiplier from nonlinear_blending_multiplier()--boost it by 1.5 if the driver is opposing the SP command.
+      4. Use a logistic (sigmoid) scaling function to softly saturate the influence.
+      5. Return the modified (target) steering angle.
+    """
+    if abs(torsion_bar_torque) < TORQUE_TO_ANGLE_DEADZONE:
+        return apply_angle
 
-# Debounce (s)
-ENTER_TIME = 0.05                       # 50 ms
-EXIT_TIME  = 0.10                       # 100 ms
+    effective_torque = torsion_bar_torque - np.sign(torsion_bar_torque) * TORQUE_TO_ANGLE_DEADZONE
+    effective_torque = np.clip(effective_torque, -TORQUE_TO_ANGLE_CLIP, TORQUE_TO_ANGLE_CLIP)
+    
+    if apply_angle * torsion_bar_torque >= 0:
+        base_multiplier = nonlinear_blending_multiplier(vehicle_speed)
+    else:
+        base_multiplier = nonlinear_blending_multiplier(vehicle_speed) * 1.5
 
-# Ramp‑back τ vs speed (m/s)
-V_5  = 5.0 / 3.6                        # 1.39
-V_10 = 10.0 / 3.6                       # 2.78
-TAU_STAND    = 1.0                      # <5 km/h
-TAU_5_10     = 1.0                      # 5…10 km/h
-TAU_ABOVE_10 = 1.0                      # >10 km/h
+    k = 1.0  # Logistic scaling steepness
+    scale = 1 / (1 + np.exp(-k * (abs(effective_torque) - (TORQUE_TO_ANGLE_CLIP / 2))))
+    
+    target_angle = apply_angle + effective_torque * base_multiplier * scale
+    return target_angle
 
-# HOLD nudge
-HOLD_NUDGE_MAX = 5.0                   # deg/frame (absolute cap)
-
-# Early resume if angle & torque small
-ANGLE_MATCH = 1.5                       # deg
-
-# Grace window after manual enable
-GRACE_TIME  = 0.4                       # s
-GRACE_BREAK = 5.0                       # Nm – break grace
-
-# -----------------------------------------------------------------------------
-# FSM
-# -----------------------------------------------------------------------------
-
-class TBState(enum.IntEnum):
-    AUTO = 0
-    HOLD = 1
-    RAMP_BACK = 2
-
-# -----------------------------------------------------------------------------
-# Controller
-# -----------------------------------------------------------------------------
-
+# ---------------- Torque Blending Car Controller ----------------
 class TorqueBlendingCarController:
-    """Three‑state driver‑override controller with dynamic thresholds."""
-
-    def __init__(self, dt: float = DT):
-        self.dt = dt
+    def __init__(self):
         self.enabled = True
+        self.steering_override = False
+        # Removed turn-signal state logic.
+        self.blending_start_time = None
+        self.previous_angle = 0.0  # in degrees
 
-        # FSM vars
-        self.state = TBState.AUTO
-        self.ramp_timer = 0.0
-        self.ramp_dur = 0.0
-        self.ramp_start = 0.0
+    def torque_blended_angle(self, apply_angle: float, torsion_bar_torque: float, vehicle_speed: float) -> float:
+        """
+        Computes the new steering angle using natural torque adjustment and then blends the result with the
+        previous command over BLENDING_RAMP_DURATION seconds.
+        """
+        target_angle = natural_torque_adjustment(apply_angle, torsion_bar_torque, vehicle_speed)
+        
+        # Start a new ramp if no ramp is active.
+        if self.blending_start_time is None:
+            self.blending_start_time = time.time()
+        
+        elapsed_time = time.time() - self.blending_start_time
+        blend_ratio = min(elapsed_time / BLENDING_RAMP_DURATION, 1.0)
+        smoothed_angle = self.previous_angle * (1 - blend_ratio) + target_angle * blend_ratio
+        return smoothed_angle
 
-        # Debouncers
-        self._above_t = 0.0
-        self._below_t = 0.0
-
-        # Misc
-        self._frame = 0
-        self._prev_lat_active = False  # for grace detection
-        self.grace = 0.0
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _smooth_step(self, x: float) -> float:
-        """3x²‑2x³ S‑curve."""
-        return x * x * (3.0 - 2.0 * x)
-
-    def _tau_for_speed(self, v: float) -> float:
-        if v < V_5:
-            return TAU_STAND
-        if v < V_10:
-            return TAU_5_10
-        return TAU_ABOVE_10
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def update_torque_blending(
-        self,
-        CS: CarStateBase,
-        CC: structs.CarControl,
-        lat_active: bool,
-        apply_angle: float,
-    ) -> tuple[bool, float]:
-        """Returns updated (lat_active, apply_angle)."""
+    def update_torque_blending(self, CS: CarStateBase, CC: structs.CarControl, lat_active: bool, apply_angle: float) -> tuple[bool, float]:
+        """
+        Updates the steering angle command by blending the SP desired angle with driver torque.
+        Uses traditional override logic: if the driver is actively providing manual input (via
+        hands_on_level or steeringPressed), the override flag remains. When manual input stops,
+        the override is cleared and the blending timer is reset so that SP control can quickly resync.
+        
+        Returns:
+            (lat_active, blended_angle), where blended_angle is in degrees.
+        """
         if not self.enabled:
             return lat_active, apply_angle
 
-        v_ego = CS.out.vEgo
-        wheel = CS.out.steeringAngleDeg
-        torque = CS.out.steeringTorque
-        angle_err = abs(apply_angle - wheel)
+        # Convert vehicle speed from m/s to km/h.
+        vehicle_speed = getattr(CS.out, 'vEgo', 0.0) * 3.6
 
-                # Detect manual enable rising edge for grace window
-        if lat_active and not self._prev_lat_active:
-            # Start a soft ramp-in from current wheel position to planner angle
-            self.grace = GRACE_TIME
-            self.state = TBState.RAMP_BACK
-            self.ramp_timer = 0.0
-            self.ramp_start = wheel
-            self.ramp_dur = GRACE_TIME  # fixed 0.4 s ramp to avoid EPS fault
-        self._prev_lat_active = lat_active
+        # Traditional manual override:
+        override_threshold = 10.0  # degrees
+        if not self.steering_override:
+            self.steering_override = CS.hands_on_level >= 3 or (
+                CS.out.steeringPressed and abs(CS.out.steeringAngleDeg - apply_angle) > override_threshold and not CS.out.standstill
+            )
+        
+        # When the driver stops providing manual input, we want SP to resume.
+        if not CS.out.steeringPressed and CS.hands_on_level < 3:
+            # Clear the override flag.
+            if self.steering_override:
+                self.steering_override = False
+                # Reset the blending timer and resynchronize to the SP desired angle.
+                self.blending_start_time = None
+                self.previous_angle = apply_angle
 
-        # Grace countdown
-        in_grace = self.grace > 0.0
-        if in_grace:
-            self.grace = max(0.0, self.grace - self.dt)
-        ignore_small_torque = in_grace and abs(torque) < GRACE_BREAK
+        if not CC.latActive:
+            self.steering_override = False
 
-        # Dynamic enter threshold (easier in curves)
-        dyn_enter = max(TORQUE_ENTER_BASE - TORQUE_ANGLE_SCALE * angle_err, TORQUE_ENTER_MIN)
+        lat_active = CC.latActive and not self.steering_override
 
-        # ----------------- Debouncers -----------------
-        if ignore_small_torque:
-            self._above_t = 0.0
-            self._below_t = 0.0
-        else:
-            self._above_t = self._above_t + self.dt if abs(torque) >= dyn_enter else 0.0
-            self._below_t = self._below_t + self.dt if abs(torque) <= TORQUE_EXIT else 0.0
+        blended_angle = self.torque_blended_angle(apply_angle, CS.out.steeringTorque, vehicle_speed)
+        self.previous_angle = blended_angle
 
-        # ----------------- FSM transitions -----------
-        if self.state == TBState.AUTO:
-            if self._above_t >= ENTER_TIME:
-                self.state = TBState.HOLD
+        return lat_active, blended_angle
 
-        elif self.state == TBState.HOLD:
-            if (angle_err < ANGLE_MATCH and self._below_t >= EXIT_TIME) or self._below_t >= 2 * EXIT_TIME:
-                self.state = TBState.RAMP_BACK
-                self.ramp_timer = 0.0
-                self.ramp_start = wheel
-                self.ramp_dur = self._tau_for_speed(v_ego)
-
-        elif self.state == TBState.RAMP_BACK:
-            if self._above_t >= ENTER_TIME:  # driver re‑grabs
-                self.state = TBState.HOLD
-            else:
-                self.ramp_timer += self.dt
-                if self.ramp_timer >= self.ramp_dur:
-                    self.state = TBState.AUTO
-
-        # ----------------- Outputs -------------------
-        self._frame += 1
-        out_lat = CC.latActive
-        out_angle = apply_angle
-
-        if self.state == TBState.HOLD:
-            if self._frame % 1 == 0:  # every frame now
-                delta = np.clip(apply_angle - wheel, -HOLD_NUDGE_MAX, HOLD_NUDGE_MAX)
-                out_angle = wheel + delta
-            else:
-                out_angle = wheel
-            out_lat = False  # disable torque
-
-        elif self.state == TBState.RAMP_BACK:
-            alpha = self._smooth_step(np.clip(self.ramp_timer / self.ramp_dur, 0.0, 1.0))
-            out_angle = self.ramp_start + alpha * (apply_angle - self.ramp_start)
-            out_lat = True
-
-        return out_lat, out_angle
-
-
-# -----------------------------------------------------------------------------
-# CarState helper (unchanged semantic)
-# -----------------------------------------------------------------------------
-
+# ---------------- Torque Blending Car State ----------------
 class TorqueBlendingCarState:
-    """Maps Tesla EAC errors to steeringDisengage."""
-
     def __init__(self):
         self.enabled = True
 
     def update_torque_blending(self, ret: structs.CarState, eac_status: str, eac_error_code: str) -> None:
         if not self.enabled:
             return
-        ret.steeringDisengage = (
-            eac_status == "EAC_INHIBITED" and eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY"
-        )
+        ret.steeringDisengage = (eac_status == "EAC_INHIBITED" and 
+                                  eac_error_code == "EAC_ERROR_HIGH_ANGLE_RATE_SAFETY")
