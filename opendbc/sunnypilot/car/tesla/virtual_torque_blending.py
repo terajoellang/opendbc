@@ -33,7 +33,7 @@ DT = 0.02                               # s – control‑loop period (50 Hz)
 
 # Base torque thresholds (Nm)
 TORQUE_ENTER_BASE = 1.0                 # driver takes control ≥
-TORQUE_ENTER_MIN  = 0.6                 # lower bound after scaling
+TORQUE_ENTER_MIN  = 0.4                 # lower bound after scaling
 TORQUE_EXIT       = 1.0                 # driver released ≤
 TORQUE_ANGLE_SCALE = 0.05               # Nm per deg of |planner‑wheel|
 
@@ -49,7 +49,7 @@ TAU_5_10     = 1.0                      # 5…10 km/h
 TAU_ABOVE_10 = 1.0                      # >10 km/h
 
 # HOLD nudge
-HOLD_NUDGE_MAX = 2.0                   # deg/frame (absolute cap)
+HOLD_NUDGE_MAX = 5.0                   # deg/frame (absolute cap)
 
 # Early resume if angle & torque small
 ANGLE_MATCH = 1.5                       # deg
