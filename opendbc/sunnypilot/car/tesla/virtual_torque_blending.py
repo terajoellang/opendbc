@@ -57,7 +57,7 @@ ANGLE_MATCH = 2.0                       # deg (user pref)
 
 # Grace window after manual enable
 GRACE_TIME  = 0.4                       # s
-GRACE_BREAK = 5.0                       # Nm – break grace
+GRACE_BREAK = 10.0                       # Nm – break grace
 
 # -----------------------------------------------------------------------------
 # FSM
