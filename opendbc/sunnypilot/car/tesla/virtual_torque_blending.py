@@ -50,7 +50,7 @@ TAU_5_10     = 1.0                      # 5…10 km/h
 TAU_ABOVE_10 = 1.0                      # >10 km/h
 
 # HOLD nudge
-HOLD_NUDGE_MAX = 7.0                   # deg/frame (user pref)
+HOLD_NUDGE_MAX = 3.0                   # deg/frame (user pref)
 
 # Early resume if angle & torque small
 ANGLE_MATCH = 2.0                       # deg (user pref)
@@ -177,19 +177,19 @@ class TorqueBlendingCarController:
 
         # --------------- Outputs -------------------
         self._frame += 1
-        out_lat = CC.latActive
+        out_lat = lat_active
         out_angle = apply_angle
 
         if in_grace:
             # During grace: ignore light torque, send planner angle directly
-            out_lat = CC.latActive
+            out_lat = lat_active
             out_angle = apply_angle
             return out_lat, out_angle
 
         if self.state == TBState.HOLD:
             delta = np.clip(apply_angle - wheel_angle, -HOLD_NUDGE_MAX, HOLD_NUDGE_MAX)
             out_angle = wheel_angle + delta
-            out_lat = False  # disable OP torque
+            out_lat = True
 
         elif self.state == TBState.RAMP_BACK:
             alpha = self._smooth_step(np.clip(self.ramp_timer / self.ramp_dur, 0.0, 1.0))
